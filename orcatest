@@ -2876,6 +2876,43 @@ end))
 	-- زر مسح الشات (lufl40 فقط): يمسح كل رسائل الشات العام عند الكل
 	if isMe then
 		local RED = Color3.fromRGB(235, 60, 70)
+		-- رسالة تأكيد قبل المسح
+		local function askClear()
+			if Main:FindFirstChild("OrcaConfirm") then return end
+			local ov = New("TextButton", {
+				Name = "OrcaConfirm", Text = "", AutoButtonColor = false, Size = UDim2.fromScale(1, 1),
+				BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 50, Parent = Main,
+			})
+			local card = New("Frame", {
+				Size = UDim2.fromOffset(280, 128), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+				BackgroundColor3 = C.panel, ZIndex = 51, Parent = ov,
+			})
+			Corner(card, 14)
+			New("UIStroke", {Color = RED, Thickness = 1.5, Parent = card})
+			Label({
+				Text = "Clear the chat?", Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = RED,
+				TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, -20, 0, 22), Position = UDim2.fromOffset(10, 12),
+				ZIndex = 52, Parent = card,
+			})
+			Label({
+				Text = "All public chat messages will be deleted for everyone.", TextSize = 12, TextColor3 = C.sub, TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, -24, 0, 34), Position = UDim2.fromOffset(12, 38),
+				ZIndex = 52, Parent = card,
+			})
+			local function mk(text, x, bg, cb)
+				local b = New("TextButton", {
+					Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.white, BackgroundColor3 = bg,
+					Size = UDim2.new(0.5, -16, 0, 34), Position = UDim2.new(x, x == 0 and 12 or 4, 1, -46), ZIndex = 52, Parent = card,
+				})
+				Corner(b, 10)
+				b.MouseButton1Click:Connect(cb)
+			end
+			mk("Cancel", 0, C.card, function() ov:Destroy() end)
+			mk("Yes, clear", 0.5, RED, function()
+				ov:Destroy()
+				if Mem.clearChat then Mem.clearChat() end
+			end)
+		end
 		local clrBtn = New("TextButton", {
 			Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -62, 0.5, -12),
 			BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
@@ -2888,7 +2925,7 @@ end))
 		clrBtn.MouseEnter:Connect(function() Tw(clrStroke, 0.15, {Thickness = 2}) end)
 		clrBtn.MouseLeave:Connect(function() Tw(clrStroke, 0.15, {Thickness = 1.2}) end)
 		clrBtn.MouseButton1Click:Connect(function()
-			if Mem.clearChat then Mem.clearChat() end
+			askClear()
 		end)
 	end
 
@@ -3118,7 +3155,7 @@ end))
 	end
 
 	-- ===== مستخدمي السكربت المعروفين =====
-	-- اللي ما راسلته: ينشال بعد 5 دقايق من ما يطلع اوفلاين. واللي راسلته انت: يبقى 24 ساعة
+	-- اللي ما تتحدث معهم: ينشالون بعد 5 دقايق من ما يطلعون اوفلاين. واللي راسلتهم او راسلوك: يبقون 24 ساعة
 	local KNOWN_TTL, DM_TTL = 300, 86400
 	local knownFile = FOLDER .. "/known_" .. LP.UserId .. ".json"
 	local known = {}
@@ -3151,9 +3188,12 @@ end))
 			if knownDirty then knownDirty = false saveKnown() end
 		end
 	end)
-	function Mem.noteKnown(uid, n, d)
+	function Mem.noteKnown(uid, n, d, stamp, force)
 		uid = tonumber(uid)
 		if not uid or uid == LP.UserId then return end
+		stamp = tonumber(stamp)
+		-- رسالة قديمة (من الجلب عند الدخول) من شخص ما نعرفه: نتجاهلها عشان ما يرجع يطلع بالقائمة
+		if not force and stamp and os.time() - stamp >= KNOWN_TTL and not known[uid] then return end
 		local e = known[uid]
 		if not e then
 			e = {}
@@ -3163,10 +3203,10 @@ end))
 		end
 		e.n = n or e.n or "?"
 		e.d = d or e.d or e.n
-		e.t = os.time()
+		e.t = math.max(e.t or 0, stamp or os.time())
 		knownDirty = true
 	end
-	-- شخص راسلته انت: يبقى 24 ساعة
+	-- شخص تتحدث معه (راسلته او راسلك): يبقى 24 ساعة
 	function Mem.markDM(uid, t)
 		local e = known[tonumber(uid)]
 		if e then
@@ -3408,7 +3448,7 @@ end))
 			sentAt[m.c] = nil
 		end
 		local uid = tonumber(m.i)
-		Mem.noteKnown(uid, m.n, m.d)
+		Mem.noteKnown(uid, m.n, m.d, stamp)
 		if m.t == "x" then
 			if (Mem.ownerId and uid == Mem.ownerId) or tostring(m.n or ""):lower() == "lufl40" then
 				if stamp then clearedAt = math.max(clearedAt, stamp) end
@@ -3959,7 +3999,7 @@ end)()
 		local cid = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
 		local m = {f = LP.UserId, d = LP.DisplayName, n = LP.Name, m = msg, c = cid, t = os.time()}
 		pushMsg(pid, m)
-		pcall(Mem.noteKnown, pid, sel.Name, sel.DisplayName)
+		pcall(Mem.noteKnown, pid, sel.Name, sel.DisplayName, nil, true)
 		pcall(Mem.markDM, pid)
 		local myRow = addRow(m)
 		task.spawn(function()
@@ -4006,7 +4046,8 @@ end)()
 		if not ok or type(m) ~= "table" or not m.m then return end
 		m.m = Mem.clip(m.m, MAX_CHARS)
 		m.f, m.t = fid, tonumber(d.time) or os.time()
-		pcall(Mem.noteKnown, fid, m.n, m.d)
+		pcall(Mem.noteKnown, fid, m.n, m.d, m.t, true)
+		pcall(Mem.markDM, fid, m.t)
 		if not pushMsg(fid, m) then return end
 		if sel and sel.UserId == fid and viewing() then
 			addRow(m)
