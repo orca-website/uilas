@@ -75,6 +75,8 @@ end
 
 local spinners, hueTexts, conns = {}, {}, {}
 
+-- حفظ مكانك (تاب / سكرول / فتح النافذة) عشان لما تعيد تشغيل السكربت يرجعك لنفس المكان
+-- (كل شي داخل جدول واحد Mem عشان ما نزيد المتغيرات المحلية - الحد 200)
 local Mem = {ready = false}
 do
 	local Env = (getgenv and getgenv()) or _G
@@ -90,6 +92,7 @@ end
 function Mem.apply(f, v)
 	if v then f.CanvasPosition = Vector2.new(0, v) end
 end
+-- قص النص بالحروف (يدعم العربي بدون ما يكسر الحرف)
 function Mem.clip(s, n)
 	s = tostring(s or "")
 	local len = utf8.len(s)
@@ -97,6 +100,7 @@ function Mem.clip(s, n)
 	if len <= n then return s end
 	return s:sub(1, utf8.offset(s, n + 1) - 1)
 end
+-- يرسل الطلب ويعيد المحاولة لو السيرفر مشغول (429 / 5xx / انقطاع). يرجع true لو انرسل
 function Mem.post(url, body)
 	local rq = request or http_request or (syn and syn.request) or (http and http.request)
 	if not rq then return false end
@@ -111,6 +115,60 @@ function Mem.post(url, body)
 	end
 	return false
 end
+-- Firebase Realtime Database (بدل ntfy)
+Mem.FB = "https://orca-chat-86f38-default-rtdb.firebaseio.com"
+function Mem.ascii(s)
+	return (s:gsub("[\194-\244][\128-\191]*", function(ch)
+		local ok, cp = pcall(utf8.codepoint, ch)
+		if not ok then return "" end
+		if cp < 0x10000 then return string.format("\\u%04x", cp) end
+		cp = cp - 0x10000
+		return string.format("\\u%04x\\u%04x", 0xD800 + math.floor(cp / 1024), 0xDC00 + cp % 1024)
+	end))
+end
+-- يرسل سجل {m=..., t=وقت السيرفر} حسب قواعد قاعدة البيانات
+function Mem.fbSend(path, payload)
+	local rq = request or http_request or (syn and syn.request) or (http and http.request)
+	if not rq then return false end
+	local okE, body = pcall(function()
+		return Mem.ascii(game:GetService("HttpService"):JSONEncode({m = payload, t = {[".sv"] = "timestamp"}}))
+	end)
+	if not okE then return false end
+	for try = 1, 3 do
+		local ok, r = pcall(rq, {
+			Url = Mem.FB .. "/" .. path .. ".json", Method = "POST",
+			Headers = {["Content-Type"] = "application/json"}, Body = body,
+		})
+		local code = (ok and type(r) == "table") and tonumber(r.StatusCode) or nil
+		if ok and type(r) == "table" and (r.Success or code == 200) then return true end
+		if code == 400 or code == 401 or code == 403 or code == 413 or code == 422 then return false end
+		task.wait(2 * try)
+	end
+	return false
+end
+-- يجلب السجلات الجديدة (بعد lastKey) مرتبة، بشكل احداث جاهزة. nil = فشل الاتصال
+function Mem.fbPull(path, lastKey)
+	local url = Mem.FB .. "/" .. path .. ".json?orderBy=%22%24key%22"
+	if lastKey then url = url .. "&startAt=%22" .. lastKey .. "%22" else url = url .. "&limitToLast=300" end
+	local ok, res = pcall(function() return game:HttpGet(url) end)
+	if not ok or type(res) ~= "string" then return nil end
+	local ok2, data = pcall(game:GetService("HttpService").JSONDecode, game:GetService("HttpService"), res)
+	if not ok2 then return nil end
+	if data == nil then return {} end
+	if type(data) ~= "table" or data.error then return nil end
+	local keys = {}
+	for k, v in pairs(data) do
+		if type(v) == "table" and type(v.m) == "string" then keys[#keys + 1] = k end
+	end
+	table.sort(keys)
+	local out = {}
+	for _, k in ipairs(keys) do
+		local v = data[k]
+		out[#out + 1] = {event = "message", id = k, time = math.floor((tonumber(v.t) or os.time() * 1000) / 1000), message = v.m}
+	end
+	return out
+end
+-- عد تنازلي مكان زر الارسال: الزر يختفي لين تنتهي المدة ثم يرجع
 function Mem.cooldown(btn, secs)
 	local f = New("Frame", {
 		Size = btn.Size, AnchorPoint = btn.AnchorPoint, Position = btn.Position,
@@ -135,13 +193,17 @@ function Mem.cooldown(btn, secs)
 		end)
 	end
 end
+-- سيرفرات مستخدمي السكربت (للـ Join)
 Mem.servers = {}
-Mem.hidden = {}
+Mem.hidden = {}   -- ناس مشغلين No entry (ما يطلعون في قائمة Join)
 
+------------------------------------------------------------------
+-- تحميل صورة الزر أول شي (قبل ما يشتغل السكربت) بدون اشعارات
+------------------------------------------------------------------
 do
 	local sources = {
 		"https://pastefy.app/cDQz9W9q/raw",
-		"https://raw.githubusercontent.com/orca-website/ORCAhub/refs/heads/main/orca_image.txt?t=" .. os.time(),
+		"https://raw.githubusercontent.com/orca-website/uiogunio-orca/refs/heads/main/orca_image.txt?t=" .. os.time(),
 	}
 	for _, url in ipairs(sources) do
 		local ok, res = pcall(function() return game:HttpGet(url) end)
@@ -168,7 +230,7 @@ do
 end
 
 ------------------------------------------------------------------
--- Drawn icons
+-- Drawn icons (built from shapes, no emojis)
 ------------------------------------------------------------------
 local TextService = game:GetService("TextService")
 
@@ -281,16 +343,19 @@ local function Icon(name, parent, size, color)
 		R(9.25, 17.5, 2.4, 9.7, -34.5, 1.2)
 		R(14.75, 17.5, 2.4, 9.7, 34.5, 1.2)
 	elseif name == "door" then
+		-- باب مفتوح
 		Box(13, 12, 14, 20, 1.5, 1.8)
 		R(8.6, 12.6, 6.4, 17, 0, 1)
 		O(11.4, 13, 1.8, Color3.fromRGB(14, 8, 14))
 		R(12, 22.4, 21, 1.8, 0, 0.9)
 	elseif name == "file" then
+		-- ملف
 		Box(11.5, 12.5, 15, 20, 2, 1.8)
 		R(11.5, 9, 8, 1.8, 0, 0.9)
 		R(11.5, 13, 8, 1.8, 0, 0.9)
 		R(10, 17, 5, 1.8, 0, 0.9)
 	elseif name == "trash" then
+		-- سلة مهملات
 		R(12, 6, 15, 2, 0, 1)
 		R(12, 4, 6, 2, 0, 1)
 		Box(12, 14.5, 12, 14, 2, 1.8)
@@ -356,17 +421,6 @@ local function Icon(name, parent, size, color)
 		L(20, 10, 14, 10, 2)
 		L(14, 10, 14, 4, 2)
 		L(14, 10, 21, 3, 2)
-	elseif name == "troll" then
-		Ring(12, 12, 20, 1.8)
-		L(7, 8, 11, 10, 1.8)
-		L(17, 8, 13, 10, 1.8)
-		O(9, 12.5, 3)
-		O(15, 12.5, 3)
-		Box(12, 18, 12, 4, 2, 1.6)
-		R(9, 18, 0.8, 3.2, 0, 0.4)
-		R(10.6, 18, 0.8, 3.2, 0, 0.4)
-		R(13.4, 18, 0.8, 3.2, 0, 0.4)
-		R(15, 18, 0.8, 3.2, 0, 0.4)
 	end
 	return root
 end
@@ -382,7 +436,7 @@ local function recolor(root, col)
 end
 
 ------------------------------------------------------------------
--- GUI root
+-- GUI root (re-execute safe)
 ------------------------------------------------------------------
 local function getRoot()
 	local ok, g = pcall(function() return gethui and gethui() end)
@@ -562,6 +616,7 @@ Corner(Content, 12)
 local allTabs = {}
 local tabOrder = 0
 
+-- يحط السكرول في مكانه (ينتظر لين النافذة تنفتح وتتحسب أحجامها)
 function Mem.set(frame, v)
 	for _ = 1, 100 do
 		if Mem.ready and Mem.max(frame) > 1 then
@@ -575,6 +630,7 @@ function Mem.set(frame, v)
 	return false
 end
 
+-- يحفظ مكان السكرول قبل ما النافذة تتقفل (لأنها وهي تتقفل تنضغط الأحجام وتنمسح المواقع)
 function Mem.snap()
 	if not Mem.ready then return end
 	for _, t in ipairs(allTabs) do
@@ -622,6 +678,7 @@ local function SelectTab(t)
 	end
 	t.page.Position = UDim2.fromOffset(0, 14)
 	Tw(t.page, 0.3, {Position = UDim2.fromOffset(0, 0)}, Enum.EasingStyle.Quint)
+	-- الشات: دايماً ينزل لآخر رسالة لما تدخله
 	if t.onShow then pcall(t.onShow) end
 end
 
@@ -802,6 +859,7 @@ local function CreateTab(name, icon)
 			val.Text = tostring(v)
 			task.spawn(pcall, cb, v)
 		end
+		-- الشريط يتغير فقط لما تسحبه أفقياً بقصد؛ لو كنت تمرر الصفحة (سحب عمودي) أو لمسة عابرة ما يتغير
 		local pending, pInput, sx, sy = false, nil, 0, 0
 		hit.InputBegan:Connect(function(i)
 			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -812,6 +870,7 @@ local function CreateTab(name, icon)
 							dragging = false
 							page.ScrollingEnabled = true
 						elseif pending and pInput == i then
+							-- نقرة قصيرة بدون حركة = اختيار القيمة في المكان
 							setFromX(i.Position.X)
 						end
 						pending = false
@@ -827,7 +886,7 @@ local function CreateTab(name, icon)
 				if i.UserInputType == Enum.UserInputType.Touch and i ~= pInput then return end
 				local dx, dy = math.abs(i.Position.X - sx), math.abs(i.Position.Y - sy)
 				if dy > 8 and dy >= dx then
-					pending = false
+					pending = false                 -- كان يمرر الصفحة
 				elseif dx > 6 then
 					pending = false
 					dragging = true
@@ -1034,6 +1093,7 @@ local function CreateTab(name, icon)
 						Position = UDim2.fromOffset(42, 3), TextTruncate = Enum.TextTruncate.AtEnd, Parent = it})
 					Label({Text = "@" .. p.Name, TextSize = 10, TextColor3 = C.sub, Size = UDim2.new(1, -78, 0, 14),
 						Position = UDim2.fromOffset(42, 20), TextTruncate = Enum.TextTruncate.AtEnd, Parent = it})
+					-- دائرة حمراء فيها عدد الرسائل الجديدة من هذا الشخص (الشات الخاص)
 					if source and p.unread and p.unread > 0 and Mem.makeBadge then
 						local bf, bl = Mem.makeBadge(it, UDim2.new(1, -26, 0.5, -9), 18, 5)
 						bf.Visible = true
@@ -1222,7 +1282,6 @@ local T = {
 	Join        = CreateTab("Join", "door"),
 	Teleport    = CreateTab("Teleport", "pin"),
 	Bang        = CreateTab("bang", "people"),
-	Troll       = CreateTab("troll", "troll"),
 	Smla        = CreateTab("smla", "eye"),
 	News        = CreateTab("News", "file"),
 	Chat        = CreateTab("Public chat", "send"),
@@ -1471,6 +1530,7 @@ local function runCopy(plr)
 	Notify("Success", "Skin copied from " .. plr.DisplayName, Color3.fromRGB(90, 220, 140), "scissors", true)
 end
 
+-- Mem.copyPause يوقف تلوين النص فوق الراس أثناء نسخ السكين
 local function copySkin(plr)
 	if copyBusy then
 		Notify("Wait...", "A skin is already being copied", C.mars2, "warn")
@@ -1483,7 +1543,7 @@ local function copySkin(plr)
 	copyBusy = true
 	task.spawn(function()
 		Mem.copyPause = true
-		task.wait(3.5)
+		task.wait(3.5)   -- التلوين يوقف أول، وبعد 3.5 ثانية يبدأ النسخ
 		local ok, err = pcall(runCopy, plr)
 		Mem.copyPause = false
 		copyBusy = false
@@ -1885,6 +1945,7 @@ T.Antidotes:Toggle("Dupe Tools", false, function(value)
 	end
 end)
 
+-- Ping / FPS: مربعات صغيرة عايمة (الألوان حسب القيمة)
 do
 	local Stats = game:GetService("Stats")
 	local G, Y, Rd = Color3.fromRGB(46, 200, 110), Color3.fromRGB(255, 205, 50), Color3.fromRGB(235, 60, 70)
@@ -1950,6 +2011,7 @@ local function playMusic(text, quiet)
 	musicSound = s
 	musicStarted = os.clock()
 	s:Play()
+	-- يوصل للكل في السيرفر: نفس ريموت صوت اللعبة
 	musicId = id
 	task.spawn(function()
 		pcall(function()
@@ -1970,6 +2032,7 @@ local function playMusic(text, quiet)
 	end)
 end
 
+-- زر أخضر دائم (أول شي فوق Play the song): يعيد تشغيل الأغنية كل ما تنتهي
 autoMusicBtn = T.Music:ColorToggle("Auto replay song", function(state)
 	musicAuto = state
 	musicTok += 1
@@ -2201,6 +2264,7 @@ for _, p in ipairs(Players:GetPlayers()) do espHook(p) end
 table.insert(conns, Players.PlayerAdded:Connect(espHook))
 table.insert(conns, Players.PlayerRemoving:Connect(espRemove))
 
+-- AUTOLOAD (اول عنصر في Misc): يشغل السكربت لوحده بعد rejoin / server hop / اي join
 do
 	local urlFile = "OrcaHub/autoload_url.txt"
 	local AUTOLOAD_URL = ""
@@ -2238,6 +2302,7 @@ do
 			Notify("Autoload", "ON: runs after rejoin / server hop / join", C.mars2)
 		end
 	end)
+	-- رابط السكربت الخام (pastefy raw): الصقه مرة وحدة وينحفظ
 	local _, linkBox = T.Misc:Input("Script link", false, function(text)
 		local url = tostring(text):match("^%s*(.-)%s*$")
 		if not url:match("^https?://[^%s\"]+$") then
@@ -2254,6 +2319,7 @@ do
 		Notify("Autoload", "Link saved", C.mars2)
 	end)
 	linkBox.Text = AUTOLOAD_URL
+	-- يشغل السكربت بعد Rejoin / Server Hop / Join من السكربت (حتى لو Autoload مطفي)
 	local warned = false
 	Mem.autoQueue = function()
 		if not qot or AUTOLOAD_URL == "" then
@@ -2363,7 +2429,7 @@ table.insert(conns, RunService.Heartbeat:Connect(function()
 	end
 end))
 
--- JOIN
+-- JOIN: تنتقل لسيرفر شخص مشغل السكربت (الأصدقاء أول، وبحث بين مستخدمي السكربت فقط)
 do
 	local jhdr = T.Join:Header("Join", true)
 	local joinPicker = T.Join:PlayerPicker(nil, function(p) return p.online and not Mem.hidden[p.UserId] end, "No script users online", function()
@@ -2426,6 +2492,7 @@ do
 		if not ok then Notify("Join", "Failed to join", C.mars2, "warn") end
 	end, {height = 70, textSize = 22, icon = "door", iconSize = 32})
 
+	-- No entry: ما يطلع اسمك في قائمة Join عند غيرك
 	T.Join:Header("Prevent anyone from entering with you", true)
 	T.Join:Toggle("No entry", false, function(state)
 		Mem.noEntry = state and true or nil
@@ -2435,7 +2502,7 @@ do
 end
 
 ------------------------------------------------------------------
--- BANG & BANG FACE
+-- BANG & BANG FACE (محدث: إصلاح مدى الحركة الخلفية والتقدم للأمام حسب الـ Size)
 ------------------------------------------------------------------
 local bangPicker = T.Bang:PlayerPicker()
 local bangBtn, faceBtn
@@ -2444,7 +2511,7 @@ local bangTarget, bangAway = nil, false
 
 local bangAnimTrack = nil
 local bangSpeed, faceSpeed = 5, 5
-local bangSize, faceSize = 4, 4
+local bangSize, faceSize = 4, 4 -- القيمة الافتراضية 4 لكليهما
 local originalAnimateScript = nil
 
 local function applyStance(active)
@@ -2598,6 +2665,7 @@ table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 				local offsetZ = math.sin(bangAnimLoop) * (bangSize * 0.35)
 				mRoot.CFrame = targetTorso.CFrame * CFrame.new(0, 0, (bangSize * 0.45) + offsetZ)
 			elseif faceOn and tHead then
+				-- تم إصلاح وتوسيع مدى الرجوع للخلف والتقدم للأمام ليتجاوب تماماً مع شريط الـ Size (من 1 إلى 10)
 				local offsetZ = math.sin(bangAnimLoop) * (faceSize * 0.18)
 				myHum.Sit = true
 				mRoot.CFrame = tHead.CFrame * CFrame.new(0, 0.4, (-0.6 - (faceSize * 0.08)) + offsetZ) * CFrame.Angles(0, math.pi, 0)
@@ -2621,299 +2689,7 @@ table.insert(conns, Players.PlayerAdded:Connect(function(p)
 end))
 
 ------------------------------------------------------------------
--- TROLL tab
-------------------------------------------------------------------
-local trollPicker = T.Troll:PlayerPicker()
-
-T.Troll:Paragraph("troll", "Pick a victim. Bench Drag = physical drag using a seat. Other moves use network ownership.")
-
-local function trollTarget()
-	local p = trollPicker.Get()
-	if not p or not p.Parent then return nil end
-	local c = p.Character
-	local r = c and c:FindFirstChild("HumanoidRootPart")
-	local h = c and c:FindFirstChildOfClass("Humanoid")
-	return p, c, r, h
-end
-
-local function grabOwn(c)
-	if not c then return end
-	for _, d in ipairs(c:GetDescendants()) do
-		if d:IsA("BasePart") then pcall(function() d:SetNetworkOwner(LP) end) end
-	end
-end
-
-local function makeBench(cf)
-	local seat = Instance.new("Seat")
-	seat.Name = "TrollBench"
-	seat.Size = Vector3.new(4, 0.4, 4)
-	seat.Material = Enum.Material.Wood
-	seat.BrickColor = BrickColor.new("Brown")
-	seat.Anchored = true
-	seat.CanCollide = false
-	seat.Transparency = 0
-	seat.CFrame = cf
-	seat.Parent = workspace
-	local back = Instance.new("Part")
-	back.Name = "TrollBenchBack"
-	back.Size = Vector3.new(4, 2, 0.4)
-	back.Material = Enum.Material.Wood
-	back.BrickColor = BrickColor.new("Brown")
-	back.Anchored = true
-	back.CanCollide = false
-	back.CFrame = cf * CFrame.new(0, 1, 2)
-	back.Parent = seat
-	return seat
-end
-
-local function benchDrag(p, c, r, hum, destCFrame, holdTime)
-	if not (p and c and r and hum) then return end
-	local seat = makeBench(r.CFrame * CFrame.new(0, -2.8, 0))
-	pcall(function() seat:Sit(hum) end)
-	task.wait(0.15)
-	TweenService:Create(seat, TweenInfo.new(0.8, Enum.EasingStyle.Linear), {CFrame = destCFrame * CFrame.new(0, -2.8, 0)}):Play()
-	task.wait(holdTime or 1.2)
-	pcall(function() hum.Sit = false end)
-	task.delay(0.3, function() if seat and seat.Parent then seat:Destroy() end end)
-end
-
-T.Troll:Button("Bench drag (grab + pull to me)", function()
-	local p, c, r, hum = trollTarget()
-	if not p or not r or not hum then Notify("troll", "Select a player with loaded character", C.mars2, "warn") return end
-	local myRoot = getRoot()
-	if not myRoot then return end
-	local myPos = myRoot.CFrame
-	grabOwn(c)
-	task.wait(0.1)
-	Notify("troll", "Dragging " .. p.Name .. " to my position", C.mars, "user")
-	benchDrag(p, c, r, hum, myPos, 1.5)
-end)
-
-T.Troll:Button("Fling player", function()
-	local p, c, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	grabOwn(c)
-	task.wait(0.1)
-	pcall(function()
-		r.AssemblyAngularVelocity = Vector3.new(math.random(-9999, 9999), math.random(-9999, 9999), math.random(-9999, 9999))
-		r.AssemblyLinearVelocity = Vector3.new(math.random(-500, 500), 800, math.random(-500, 500))
-	end)
-	Notify("troll", "Flinged " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Fling fling ball", function()
-	local p, c, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	local ball = New("Part", {
-		Shape = Enum.PartType.Ball, Size = Vector3.new(15, 15, 15), Material = Enum.Material.Neon,
-		Color = C.mars, Transparency = 0.4, CanCollide = false, CFrame = r.CFrame, Parent = workspace,
-	})
-	task.spawn(function()
-		ball.AssemblyLinearVelocity = Vector3.new(0, 500, 0)
-		if firetouchinterest then
-			pcall(function()
-				firetouchinterest(ball, r, 0)
-				task.wait(0.05)
-				firetouchinterest(ball, r, 1)
-			end)
-		end
-		task.wait(2)
-		if ball and ball.Parent then ball:Destroy() end
-	end)
-	Notify("troll", "Fling ball launched at " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Kill player (seat drop)", function()
-	local p, c, r, hum = trollTarget()
-	if not p or not r or not hum then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	grabOwn(c)
-	task.wait(0.1)
-	local seat = makeBench(r.CFrame * CFrame.new(0, -2.8, 0))
-	pcall(function() seat:Sit(hum) end)
-	task.wait(0.15)
-	seat.Anchored = true
-	seat.CFrame = CFrame.new(r.Position.X, 5000, r.Position.Z)
-	task.wait(0.2)
-	seat.Anchored = false
-	if seat then
-		pcall(function() seat.AssemblyLinearVelocity = Vector3.new(0, -5000, 0) end)
-	end
-	pcall(function() hum.Health = 0 end)
-	task.delay(4, function() if seat and seat.Parent then seat:Destroy() end end)
-	Notify("troll", "Dropped " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Void drop", function()
-	local p, c, r, hum = trollTarget()
-	if not p or not r or not hum then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	grabOwn(c)
-	task.wait(0.1)
-	local seat = makeBench(r.CFrame * CFrame.new(0, -2.8, 0))
-	pcall(function() seat:Sit(hum) end)
-	task.wait(0.15)
-	seat.CFrame = CFrame.new(0, -1000, 0)
-	task.delay(2, function()
-		pcall(function() hum.Sit = false end)
-		if seat and seat.Parent then seat:Destroy() end
-	end)
-	Notify("troll", "Voided " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Bring player (bench)", function()
-	local p, c, r, hum = trollTarget()
-	if not p or not r or not hum then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	local myRoot = getRoot()
-	if not myRoot then return end
-	grabOwn(c)
-	task.wait(0.1)
-	benchDrag(p, c, r, hum, myRoot.CFrame * CFrame.new(0, 0, 3), 0.5)
-	Notify("troll", "Brought " .. p.Name .. " to me", C.mars, "user")
-end)
-
-T.Troll:Button("Teleport to player", function()
-	local p, _, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	local myRoot = getRoot()
-	if not myRoot then return end
-	myRoot.CFrame = r.CFrame * CFrame.new(0, 0, 3)
-	Notify("troll", "Teleported to " .. p.Name, C.mars, "pin")
-end)
-
-T.Troll:Button("Freeze player", function()
-	local p, c, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	grabOwn(c)
-	task.spawn(function()
-		for _ = 1, 40 do
-			local _, _, rr = trollTarget()
-			if not rr then break end
-			pcall(function()
-				rr.AssemblyLinearVelocity = Vector3.zero
-				rr.AssemblyAngularVelocity = Vector3.zero
-			end)
-			task.wait(0.05)
-		end
-	end)
-	Notify("troll", "Froze " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Launch to sky", function()
-	local p, c, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	grabOwn(c)
-	task.wait(0.1)
-	pcall(function() r.AssemblyLinearVelocity = Vector3.new(0, 5000, 0) end)
-	Notify("troll", "Launched " .. p.Name, C.mars, "user")
-end)
-
-local spinConn, spinBtn
-spinBtn = T.Troll:ColorToggle("Spin player", function(state)
-	if state then
-		local p, c = trollTarget()
-		if not p then spinBtn.Set(false) Notify("troll", "Select a player first", C.mars2, "warn") return end
-		grabOwn(c)
-		spinConn = RunService.Heartbeat:Connect(function()
-			local _, _, rr = trollTarget()
-			if rr then pcall(function() rr.AssemblyAngularVelocity = Vector3.new(0, 800, 0) end) end
-		end)
-		Notify("troll", "Spinning " .. p.Name, C.mars, "user")
-	else
-		if spinConn then spinConn:Disconnect() spinConn = nil end
-		Notify("troll", "Spin stopped", C.mars2)
-	end
-end, "user")
-
-local sitConn, sitBtn
-sitBtn = T.Troll:ColorToggle("Sit on head", function(state)
-	if state then
-		local p = trollTarget()
-		if not p then sitBtn.Set(false) Notify("troll", "Select a player first", C.mars2, "warn") return end
-		local myHum = getHum()
-		if myHum then myHum.Sit = true end
-		sitConn = RunService.Heartbeat:Connect(function()
-			local _, _, rr = trollTarget()
-			local myRoot = getRoot()
-			if rr and myRoot then
-				pcall(function()
-					myRoot.CFrame = rr.CFrame * CFrame.new(0, 3.5, 0)
-					myRoot.AssemblyLinearVelocity = Vector3.zero
-				end)
-			end
-		end)
-		Notify("troll", "Sitting on " .. p.Name, C.mars, "user")
-	else
-		if sitConn then sitConn:Disconnect() sitConn = nil end
-		local myHum = getHum()
-		if myHum then myHum.Sit = false end
-		Notify("troll", "Stopped sitting", C.mars2)
-	end
-end, "user")
-
-local rbConn, rbBtn
-rbBtn = T.Troll:ColorToggle("Rainbow player", function(state)
-	if state then
-		local p, c = trollTarget()
-		if not p or not c then rbBtn.Set(false) Notify("troll", "Select a player first", C.mars2, "warn") return end
-		rbConn = RunService.Heartbeat:Connect(function()
-			local _, cc = trollTarget()
-			if not cc then return end
-			local col = Color3.fromHSV((os.clock() * 0.4) % 1, 1, 1)
-			for _, d in ipairs(cc:GetDescendants()) do
-				if d:IsA("BasePart") then pcall(function() d.Color = col end) end
-			end
-		end)
-		Notify("troll", "Rainbow on " .. p.Name, C.mars, "user")
-	else
-		if rbConn then rbConn:Disconnect() rbConn = nil end
-		Notify("troll", "Rainbow off", C.mars2)
-	end
-end, "user")
-
-T.Troll:Button("Invisible player (client)", function()
-	local p, c = trollTarget()
-	if not p or not c then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	for _, d in ipairs(c:GetDescendants()) do
-		if d:IsA("BasePart") then pcall(function() d.LocalTransparencyModifier = 1 end) end
-	end
-	Notify("troll", "Hid " .. p.Name .. " (client-side)", C.mars, "eye")
-end)
-
-T.Troll:Button("Strip accessories", function()
-	local p, c = trollTarget()
-	if not p or not c then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	for _, d in ipairs(c:GetChildren()) do
-		if d:IsA("Accessory") or d:IsA("Hat") then pcall(function() d:Destroy() end) end
-	end
-	Notify("troll", "Stripped " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:Button("Punch knockback", function()
-	local p, c, r = trollTarget()
-	if not p or not r then Notify("troll", "Select a player first", C.mars2, "warn") return end
-	local myRoot = getRoot()
-	if not myRoot then return end
-	grabOwn(c)
-	task.wait(0.1)
-	local dir = r.Position - myRoot.Position
-	if dir.Magnitude < 0.1 then dir = myRoot.CFrame.LookVector end
-	pcall(function() r.AssemblyLinearVelocity = dir.Unit * 300 + Vector3.new(0, 200, 0) end)
-	Notify("troll", "Punched " .. p.Name, C.mars, "user")
-end)
-
-T.Troll:SmallButton("reset all", Color3.fromRGB(225, 50, 60), function()
-	if spinConn then spinConn:Disconnect() spinConn = nil end
-	if sitConn then sitConn:Disconnect() sitConn = nil end
-	if rbConn then rbConn:Disconnect() rbConn = nil end
-	if spinBtn then spinBtn.Set(false) end
-	if sitBtn then sitBtn.Set(false) end
-	if rbBtn then rbBtn.Set(false) end
-	local myHum = getHum()
-	if myHum then myHum.Sit = false end
-	Notify("troll", "All trolls stopped", C.mars2)
-end)
-
-------------------------------------------------------------------
--- SMLA tab
+-- SMLA tab (player tracker)
 ------------------------------------------------------------------
 local GREEN = Color3.fromRGB(46, 200, 110)
 local RED = Color3.fromRGB(235, 60, 70)
@@ -3052,11 +2828,11 @@ table.insert(conns, RunService.Heartbeat:Connect(function()
 end))
 
 ------------------------------------------------------------------
--- PUBLIC CHAT
+-- CHAT (شات بين مستخدمي السكربت - تاب تحت smla)
 ------------------------------------------------------------------
 ;(function()
 	local HttpService = game:GetService("HttpService")
-	local TOPIC = "orca_hub_chat_v2_r6t1n8c3w7"
+	local TOPIC = "orca_hub_chat_v2_r6t1n8c3w7"   -- غيّره لاسم سري، وكل من عنده نفس الاسم يشوف الشات
 	local MAX_MSGS = 300
 	local MAX_CHARS = 100
 	local FOLDER = "OrcaHub"
@@ -3066,6 +2842,7 @@ end))
 	local isMe = LP.Name:lower() == "lufl40"
 	local send
 
+	-- يحول الرموز الى \uXXXX عشان تنرسل بدون مشاكل
 	local function jsonSafe(s)
 		return (s:gsub("[\194-\244][\128-\191]*", function(ch)
 			local ok, cp = pcall(utf8.codepoint, ch)
@@ -3075,6 +2852,7 @@ end))
 			return string.format("\\u%04x\\u%04x", 0xD800 + math.floor(cp / 1024), 0xDC00 + cp % 1024)
 		end))
 	end
+	-- هل في الرسالة رموز (غير الانجليزي والعربي)؟
 	local function hasSymbols(s)
 		for ch in s:gmatch("[\194-\244][\128-\191]*") do
 			local ok, cp = pcall(utf8.codepoint, ch)
@@ -3120,7 +2898,9 @@ end))
 	local function scrollBottom()
 		list.CanvasPosition = Vector2.new(0, math.max(0, list.AbsoluteCanvasSize.Y))
 	end
+	-- لما تدخل الشات دايماً ينزل لآخر رسالة
 	T.Chat.onShow = function()
+		-- يثبت على آخر رسالة قبل ما ينرسم أول اطار (بدون ما تشوفه ينزل)
 		local t0, conn = os.clock(), nil
 		scrollBottom()
 		conn = RunService.RenderStepped:Connect(function()
@@ -3129,6 +2909,7 @@ end))
 		end)
 	end
 
+	-- زر التكبير / التصغير
 	local maxBtn = New("TextButton", {
 		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -28, 0.5, -12),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
@@ -3145,21 +2926,59 @@ end))
 	maxBtn.MouseEnter:Connect(function() Tw(maxStroke, 0.15, {Color = C.mars2, Thickness = 2}) end)
 	maxBtn.MouseLeave:Connect(function() Tw(maxStroke, 0.15, {Color = C.mars, Thickness = 1.2}) end)
 
+	-- زر مسح الشات (lufl40 فقط): يمسح كل رسائل الشات العام عند الكل
 	if isMe then
-		local RED2 = Color3.fromRGB(235, 60, 70)
+		local RED = Color3.fromRGB(235, 60, 70)
+		-- رسالة تأكيد قبل المسح
+		local function askClear()
+			if Main:FindFirstChild("OrcaConfirm") then return end
+			local ov = New("TextButton", {
+				Name = "OrcaConfirm", Text = "", AutoButtonColor = false, Size = UDim2.fromScale(1, 1),
+				BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 50, Parent = Main,
+			})
+			local card = New("Frame", {
+				Size = UDim2.fromOffset(280, 128), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+				BackgroundColor3 = C.panel, ZIndex = 51, Parent = ov,
+			})
+			Corner(card, 14)
+			New("UIStroke", {Color = RED, Thickness = 1.5, Parent = card})
+			Label({
+				Text = "Clear the chat?", Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = RED,
+				TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, -20, 0, 22), Position = UDim2.fromOffset(10, 12),
+				ZIndex = 52, Parent = card,
+			})
+			Label({
+				Text = "All public chat messages will be deleted for everyone.", TextSize = 12, TextColor3 = C.sub, TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, -24, 0, 34), Position = UDim2.fromOffset(12, 38),
+				ZIndex = 52, Parent = card,
+			})
+			local function mk(text, x, bg, cb)
+				local b = New("TextButton", {
+					Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.white, BackgroundColor3 = bg,
+					Size = UDim2.new(0.5, -16, 0, 34), Position = UDim2.new(x, x == 0 and 12 or 4, 1, -46), ZIndex = 52, Parent = card,
+				})
+				Corner(b, 10)
+				b.MouseButton1Click:Connect(cb)
+			end
+			mk("Cancel", 0, C.card, function() ov:Destroy() end)
+			mk("Yes, clear", 0.5, RED, function()
+				ov:Destroy()
+				if Mem.clearChat then Mem.clearChat() end
+			end)
+		end
 		local clrBtn = New("TextButton", {
 			Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -62, 0.5, -12),
 			BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
 		})
 		Corner(clrBtn, 8)
-		local clrStroke = New("UIStroke", {Color = RED2, Thickness = 1.2, Parent = clrBtn})
-		local icClr = Icon("trash", clrBtn, 14, RED2)
+		local clrStroke = New("UIStroke", {Color = RED, Thickness = 1.2, Parent = clrBtn})
+		local icClr = Icon("trash", clrBtn, 14, RED)
 		icClr.AnchorPoint = Vector2.new(0.5, 0.5)
 		icClr.Position = UDim2.fromScale(0.5, 0.5)
 		clrBtn.MouseEnter:Connect(function() Tw(clrStroke, 0.15, {Thickness = 2}) end)
 		clrBtn.MouseLeave:Connect(function() Tw(clrStroke, 0.15, {Thickness = 1.2}) end)
 		clrBtn.MouseButton1Click:Connect(function()
-			if Mem.clearChat then Mem.clearChat() end
+			askClear()
 		end)
 	end
 
@@ -3179,6 +2998,7 @@ end))
 	end
 	maxBtn.MouseButton1Click:Connect(function() setExpanded(not expanded) end)
 
+	-- خانة الكتابة + زر الارسال
 	local inputWrap = New("Frame", {
 		Size = UDim2.new(1, -52, 0, 40), Position = UDim2.new(0, 0, 1, -40), BackgroundColor3 = C.card, Parent = holder,
 	})
@@ -3190,6 +3010,7 @@ end))
 		Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
 		ClearTextOnFocus = false, Parent = inputWrap,
 	})
+	-- أقصى حد 100 حرف
 	box:GetPropertyChangedSignal("Text"):Connect(function()
 		local len = utf8.len(box.Text)
 		if (len and len > MAX_CHARS) or (not len and #box.Text > MAX_CHARS) then
@@ -3216,8 +3037,10 @@ end))
 	sendBtn.MouseLeave:Connect(function() Tw(sendScale, 0.15, {Scale = 1}, Enum.EasingStyle.Back) end)
 	local startCooldown = Mem.cooldown(sendBtn, 4)
 
+	-- الرسائل
 	local rows, rowOrder, seen = {}, 0, {}
 
+	-- حالة الاتصال (اخضر = متصل ويشغل السكربت / رمادي = خارج)
 	local ON, OFF = Color3.fromRGB(46, 200, 110), Color3.fromRGB(125, 115, 125)
 	local PING, WINDOW = 150, 330
 	local presence, sentAt, skew, dotList = {}, {}, 0, {}
@@ -3247,6 +3070,7 @@ end))
 		return string.format("#%02x%02x%02x", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
 	end
 
+	-- صف رسالة صغير (صورة + اسم + يوزر + نص)، يستخدمه الشات والشات الخاص
 	local function buildRow(parent, d, order)
 		local name = Mem.clip(d.d or d.u or "?", 24)
 		local uname = d.n and ("@" .. Mem.clip(d.n, 24)) or ""
@@ -3305,6 +3129,7 @@ end))
 			TextTruncate = Enum.TextTruncate.AtEnd, LayoutOrder = 1, Parent = colF})
 		head.RichText = true
 		if isOwnerRow then
+			-- التاج بعيد عن الاسم (أقصى اليمين)
 			local cr = Icon("crown", row, 15, Color3.fromRGB(255, 200, 40))
 			cr.AnchorPoint = Vector2.new(1, 0)
 			cr.Position = UDim2.new(1, -1, 0, 0)
@@ -3318,6 +3143,7 @@ end))
 		})
 		msgL.RichText = false
 
+		-- اضغط مطولاً على الرسالة = تنسخ
 		row.InputBegan:Connect(function(i)
 			if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
 			local p0 = i.Position
@@ -3332,6 +3158,7 @@ end))
 			end)
 		end)
 
+		-- lufl40: ثلاث ضغطات سريعة على اي رسالة = تنحذف عند الكل (الشات العام)
 		if isMe and d.c then
 			local taps, lastTap = 0, 0
 			row.InputBegan:Connect(function(i)
@@ -3349,6 +3176,7 @@ end))
 	end
 	Mem.row, Mem.isOnline, Mem.ON, Mem.OFF = buildRow, isOnline, ON, OFF
 
+	-- ===== تحميل البروفايلات مسبقاً (صور الرأس) =====
 	local thumbCache = {}
 	local function preloadThumb(uid)
 		uid = tonumber(uid)
@@ -3364,6 +3192,7 @@ end))
 	for _, p in ipairs(Players:GetPlayers()) do preloadThumb(p.UserId) end
 	table.insert(conns, Players.PlayerAdded:Connect(function(p) preloadThumb(p.UserId) end))
 
+	-- ===== الأصدقاء (يطلعون أول في القوائم) =====
 	local friendCache = {}
 	local function isFriend(id)
 		local v = friendCache[id]
@@ -3378,6 +3207,8 @@ end))
 		return v
 	end
 
+	-- ===== مستخدمي السكربت المعروفين =====
+	-- اللي ما تتحدث معهم: ينشالون بعد 5 دقايق من ما يطلعون اوفلاين. واللي راسلتهم او راسلوك: يبقون 24 ساعة
 	local KNOWN_TTL, DM_TTL = 300, 86400
 	local knownFile = FOLDER .. "/known_" .. LP.UserId .. ".json"
 	local known = {}
@@ -3410,9 +3241,12 @@ end))
 			if knownDirty then knownDirty = false saveKnown() end
 		end
 	end)
-	function Mem.noteKnown(uid, n, d)
+	function Mem.noteKnown(uid, n, d, stamp, force)
 		uid = tonumber(uid)
 		if not uid or uid == LP.UserId then return end
+		stamp = tonumber(stamp)
+		-- رسالة قديمة (من الجلب عند الدخول) من شخص ما نعرفه: نتجاهلها عشان ما يرجع يطلع بالقائمة
+		if not force and stamp and os.time() - stamp >= KNOWN_TTL and not known[uid] then return end
 		local e = known[uid]
 		if not e then
 			e = {}
@@ -3422,9 +3256,10 @@ end))
 		end
 		e.n = n or e.n or "?"
 		e.d = d or e.d or e.n
-		e.t = os.time()
+		e.t = math.max(e.t or 0, stamp or os.time())
 		knownDirty = true
 	end
+	-- شخص تتحدث معه (راسلته او راسلك): يبقى 24 ساعة
 	function Mem.markDM(uid, t)
 		local e = known[tonumber(uid)]
 		if e then
@@ -3432,6 +3267,7 @@ end))
 			knownDirty = true
 		end
 	end
+	-- الترتيب: (رسائل غير مقروءة) ثم المتصلين (الأصدقاء أول) ثم الاوفلاين تحتهم
 	function Mem.knownList(withUnread)
 		local out = {}
 		for id, e in pairs(known) do
@@ -3454,6 +3290,7 @@ end))
 	end
 	for id in pairs(known) do preloadThumb(id) isFriend(id) end
 
+	-- ===== منع السبام: 5 رسائل متشابهة = ميوت (5 / 10 / 15 / 20 دقيقة، وكل مرة تزيد) =====
 	local spam = Mem.S.spam or {}
 	Mem.S.spam = spam
 	local function norm(s)
@@ -3501,6 +3338,7 @@ end))
 		return false
 	end
 
+	-- ===== حفظ الشات العام (يبقى عندك للابد) =====
 	local histFile = FOLDER .. "/public_chat.json"
 	local hist = {}
 	do
@@ -3534,7 +3372,7 @@ end))
 	local function addMsg(d, noSave)
 		if not noSave then
 			table.insert(hist, {c = d.c, i = d.i, n = d.n, d = d.d, m = d.m, t = os.time()})
-			while #hist > 30 do table.remove(hist, 1) end
+			while #hist > 1500 do table.remove(hist, 1) end
 			histDirty = true
 		end
 		rowOrder += 1
@@ -3547,6 +3385,7 @@ end))
 		return row
 	end
 
+	-- حذف رسالة (يستقبلها الكل من lufl40 فقط)
 	local function removeByCid(cid)
 		deleted[cid] = true
 		local row = rowByCid[cid]
@@ -3561,6 +3400,7 @@ end))
 			if hist[i].c == cid then table.remove(hist, i) histDirty = true break end
 		end
 	end
+	-- مسح كل رسائل الشات العام
 	local function clearAll()
 		for i = #rows, 1, -1 do
 			rows[i]:Destroy()
@@ -3575,8 +3415,7 @@ end))
 		clearAll()
 		task.spawn(function()
 			local dc = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
-			Mem.post("https://ntfy.sh/" .. TOPIC,
-				jsonSafe(HttpService:JSONEncode({t = "x", c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName})))
+			Mem.fbSend("chat", HttpService:JSONEncode({t = "x", c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName}))
 		end)
 		Notify("Public chat", "Chat cleared", C.mars2, "chat", false, 1.5)
 	end
@@ -3585,14 +3424,11 @@ end))
 		removeByCid(cid)
 		task.spawn(function()
 			local dc = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
-			Mem.post("https://ntfy.sh/" .. TOPIC,
-				jsonSafe(HttpService:JSONEncode({t = "d", k = cid, c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName})))
+			Mem.fbSend("chat", HttpService:JSONEncode({t = "d", k = cid, c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName}))
 		end)
 	end
 
-	local hstart = math.max(1, #hist - 29)
-	for i = hstart, #hist do
-		local hm = hist[i]
+	for _, hm in ipairs(hist) do
 		if type(hm) == "table" and hm.m then
 			if hm.c then seen[hm.c] = true end
 			addMsg(hm, true)
@@ -3600,6 +3436,7 @@ end))
 	end
 	task.delay(0.5, scrollBottom)
 
+	-- استقبال (WebSocket فوري + جلب احتياطي)
 	local function refreshDots()
 		for i = #dotList, 1, -1 do
 			local e = dotList[i]
@@ -3612,6 +3449,7 @@ end))
 		end
 	end
 
+	-- اشعار الرسائل الجديدة (دائرة حمراء فيها العدد زي انستا)
 	local function makeBadge(parent, pos, size, z)
 		local f = New("Frame", {
 			Size = UDim2.fromOffset(size, size), Position = pos, BackgroundColor3 = Color3.fromRGB(235, 60, 70),
@@ -3648,6 +3486,7 @@ end))
 		showUnread()
 	end
 
+	-- استقبال (WebSocket فوري + جلب احتياطي)
 	local wsLast, wsUp = 0, false
 	local function handle(d)
 		if type(d) ~= "table" or d.event ~= "message" or not d.id or seen[d.id] then return end
@@ -3660,7 +3499,7 @@ end))
 			sentAt[m.c] = nil
 		end
 		local uid = tonumber(m.i)
-		Mem.noteKnown(uid, m.n, m.d)
+		Mem.noteKnown(uid, m.n, m.d, stamp)
 		if m.t == "x" then
 			if (Mem.ownerId and uid == Mem.ownerId) or tostring(m.n or ""):lower() == "lufl40" then
 				if stamp then clearedAt = math.max(clearedAt, stamp) end
@@ -3674,6 +3513,7 @@ end))
 			end
 			return
 		end
+		-- سيرفر الشخص (للـ Join)
 		if uid and uid ~= LP.UserId then
 			if m.x then
 				Mem.servers[uid] = nil
@@ -3702,6 +3542,7 @@ end))
 		end
 		if stamp and stamp < clearedAt then return end
 		m.m = Mem.clip(m.m, MAX_CHARS)
+		-- سبام من غيرك: ميوت عندك
 		if uid and uid ~= LP.UserId and counting and tostring(m.n or ""):lower() ~= "lufl40" then
 			if isMuted(uid) then return end
 			local hit, mins = spamHit(uid, m.m)
@@ -3718,20 +3559,14 @@ end))
 		end
 	end
 
-	local since = "12h"
+	local lastKey, pollOkAt = nil, -1000
 	local function poll()
-		local ok, res = pcall(function()
-			return game:HttpGet("https://ntfy.sh/" .. TOPIC .. "/json?poll=1&since=" .. since)
-		end)
-		if not ok or type(res) ~= "string" then
-			return
-		end
-		for line in res:gmatch("[^\n]+") do
-			local ok2, d = pcall(HttpService.JSONDecode, HttpService, line)
-			if ok2 and type(d) == "table" and d.event == "message" and d.id then
-				since = d.id
-				handle(d)
-			end
+		local list = Mem.fbPull("chat", lastKey)
+		if not list then return end
+		pollOkAt = os.clock()
+		for _, d in ipairs(list) do
+			lastKey = d.id
+			handle(d)
 		end
 	end
 
@@ -3739,43 +3574,21 @@ end))
 		while Gui.Parent do
 			pcall(poll)
 			counting = true
-			task.wait(wsUp and 20 or 12)
+			task.wait(4)
 		end
 	end)
 
-	task.spawn(function()
-		if not (WebSocket and WebSocket.connect) then return end
-		while Gui.Parent do
-			local ok, ws = pcall(WebSocket.connect, "wss://ntfy.sh/" .. TOPIC .. "/ws")
-			if ok and ws then
-				local closed = false
-				wsUp = true
-				wsLast = os.clock()
-				pcall(function()
-					ws.OnMessage:Connect(function(raw)
-						wsLast = os.clock()
-						local ok2, d = pcall(HttpService.JSONDecode, HttpService, raw)
-						if ok2 then handle(d) end
-					end)
-					ws.OnClose:Connect(function() closed = true end)
-				end)
-				while Gui.Parent and not closed and os.clock() - wsLast < 100 do task.wait(0.25) end
-				wsUp = false
-				pcall(function() ws:Close() end)
-			end
-			task.wait(1)
-		end
-	end)
-
+	-- الحالة: online لو آخر جلب نجح
 	task.spawn(function()
 		while Gui.Parent do
-			local live = wsUp and (os.clock() - wsLast) < 100
+			local live = (os.clock() - pollOkAt) < 20
 			statusL.Text = live and "online" or "offline"
 			statusL.TextColor3 = live and ON or Color3.fromRGB(235, 90, 90)
 			task.wait(1)
 		end
 	end)
 
+	-- ارسال (تظهر رسالتك فوراً عندك)
 	local lastSend = 0
 	send = function()
 		local msg = box.Text:match("^%s*(.-)%s*$")
@@ -3809,9 +3622,9 @@ end))
 		sentAt[cid] = os.time()
 		local myRow = addMsg({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg})
 		task.spawn(function()
-			local sent = Mem.post("https://ntfy.sh/" .. TOPIC,
-				jsonSafe(HttpService:JSONEncode({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil})))
+			local sent = Mem.fbSend("chat", HttpService:JSONEncode({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
 			if not sent and not isOwner() then
+				-- الرسالة ما انرسلت: تنحذف ويطلع اشعار احمر 10 ثواني
 				if myRow then
 					for i = #rows, 1, -1 do
 						if rows[i] == myRow then table.remove(rows, i) break end
@@ -3827,16 +3640,12 @@ end))
 			end
 		end)
 	end
+	-- نبض الاتصال: كل فترة نبعث "انا متصل" عشان يطلع اخضر عند غيرك
 	local function sendPresence(kind)
 		if not req then return end
 		local cid = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
 		sentAt[cid] = os.time()
-		pcall(req, {
-			Url = "https://ntfy.sh/" .. TOPIC,
-			Method = "POST",
-			Headers = {["Content-Type"] = "text/plain; charset=utf-8"},
-			Body = HttpService:JSONEncode({t = kind, c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}),
-		})
+		pcall(Mem.fbSend, "chat", HttpService:JSONEncode({t = kind, c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
 	end
 	Mem.sendPresence, Mem.jsonSafe = sendPresence, jsonSafe
 	task.spawn(function()
@@ -3873,7 +3682,7 @@ end))
 end)()
 
 ------------------------------------------------------------------
--- PRIVATE CHAT
+-- PRIVATE CHAT (شات خاص: مشفّر + محفوظ عندك للابد)
 ------------------------------------------------------------------
 ;(function()
 	local HttpService = game:GetService("HttpService")
@@ -3891,8 +3700,10 @@ end)()
 	local sel, selectPartner
 	local convs, dseen, dmDots, rows, rowOrder = {}, {}, {}, {}, 0
 	local unreadBy, notifyOn = {}, false
+	-- عدد الرسائل الجديدة لكل شخص (يطلع في قائمة السهم)
 	Mem.unreadFn = function(id) return unreadBy[id] or 0 end
 
+	-- تشفير بسيط + اسم صندوق وارد خاص لكل شخص
 	local function hash(str)
 		local h1, h2 = 2166136261, 5381
 		for i = 1, #str do
@@ -3928,6 +3739,7 @@ end)()
 		return table.concat(out)
 	end
 
+	-- حفظ المحادثات في ملف (يبقى حتى لو شلت السكربت وشغلته)
 	local function fpath(pid) return FOLDER .. "/dm_" .. LP.UserId .. "_" .. pid .. ".json" end
 	local function loadConv(pid)
 		if convs[pid] then return convs[pid] end
@@ -3970,6 +3782,7 @@ end)()
 		return true
 	end
 
+	-- الواجهة
 	local hdr = tab:Header("Private chat", true)
 	local statusL = Label({
 		Text = "connecting", TextSize = 10, TextColor3 = C.sub, TextXAlignment = Enum.TextXAlignment.Right,
@@ -4003,7 +3816,9 @@ end)()
 	local function scrollBottom()
 		list.CanvasPosition = Vector2.new(0, math.max(0, list.AbsoluteCanvasSize.Y))
 	end
+	-- لما تدخل الشات الخاص دايماً ينزل لآخر رسالة
 	tab.onShow = function()
+		-- يثبت على آخر رسالة قبل ما ينرسم أول اطار (بدون ما تشوفه ينزل)
 		local t0, conn = os.clock(), nil
 		scrollBottom()
 		conn = RunService.RenderStepped:Connect(function()
@@ -4012,6 +3827,7 @@ end)()
 		end)
 	end
 
+	-- زر التكبير / التصغير (نفس زر Public chat)
 	local maxBtn = New("TextButton", {
 		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -28, 0.5, -12),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
@@ -4043,6 +3859,7 @@ end)()
 	end
 	maxBtn.MouseButton1Click:Connect(function() setExpanded(not expanded) end)
 
+	-- زر البحث (جنب زر التكبير): تكتب اليوزر أو أول الاسم وتطلع لك الناس
 	local searchBtn = New("TextButton", {
 		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -62, 0.5, -12),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
@@ -4111,6 +3928,7 @@ end)()
 		ClearTextOnFocus = false, Parent = inputWrap,
 	})
 	local sendDM
+	-- أقصى حد 100 حرف
 	box:GetPropertyChangedSignal("Text"):Connect(function()
 		local len = utf8.len(box.Text)
 		if (len and len > MAX_CHARS) or (not len and #box.Text > MAX_CHARS) then
@@ -4171,6 +3989,7 @@ end)()
 		task.delay(0.2, scrollBottom)
 	end
 
+	-- ارسال
 	local lastSend = 0
 	sendDM = function()
 		local msg = box.Text:match("^%s*(.-)%s*$")
@@ -4195,7 +4014,7 @@ end)()
 		local cid = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
 		local m = {f = LP.UserId, d = LP.DisplayName, n = LP.Name, m = msg, c = cid, t = os.time()}
 		pushMsg(pid, m)
-		pcall(Mem.noteKnown, pid, sel.Name, sel.DisplayName)
+		pcall(Mem.noteKnown, pid, sel.Name, sel.DisplayName, nil, true)
 		pcall(Mem.markDM, pid)
 		local myRow = addRow(m)
 		task.spawn(function()
@@ -4203,8 +4022,9 @@ end)()
 				return LP.UserId .. "." .. encrypt(HttpService:JSONEncode({d = LP.DisplayName, n = LP.Name, m = msg, c = cid}), LP.UserId, pid)
 			end)
 			if not okE then return end
-			local sent = Mem.post("https://ntfy.sh/" .. inbox(pid), body)
+			local sent = Mem.fbSend("dm/" .. inbox(pid), body)
 			if not sent and LP.Name:lower() ~= "lufl40" then
+				-- الرسالة ما انرسلت: تنحذف ويطلع اشعار احمر 10 ثواني
 				if myRow then
 					for i = #rows, 1, -1 do
 						if rows[i] == myRow then table.remove(rows, i) break end
@@ -4228,6 +4048,7 @@ end)()
 		sendDM()
 	end)
 
+	-- استقبال (صندوقي الخاص فقط)
 	local function onEvent(d)
 		if type(d) ~= "table" or d.event ~= "message" or not d.id or dseen[d.id] then return end
 		dseen[d.id] = true
@@ -4240,7 +4061,8 @@ end)()
 		if not ok or type(m) ~= "table" or not m.m then return end
 		m.m = Mem.clip(m.m, MAX_CHARS)
 		m.f, m.t = fid, tonumber(d.time) or os.time()
-		pcall(Mem.noteKnown, fid, m.n, m.d)
+		pcall(Mem.noteKnown, fid, m.n, m.d, m.t, true)
+		pcall(Mem.markDM, fid, m.t)
 		if not pushMsg(fid, m) then return end
 		if sel and sel.UserId == fid and viewing() then
 			addRow(m)
@@ -4255,20 +4077,14 @@ end)()
 	end
 
 	local myInbox = inbox(LP.UserId)
-	local wsLast, since, wsUp = 0, "all", false
+	local lastKey, pollOkAt = nil, -1000
 	local function poll()
-		local ok, res = pcall(function()
-			return game:HttpGet("https://ntfy.sh/" .. myInbox .. "/json?poll=1&since=" .. since)
-		end)
-		if not ok or type(res) ~= "string" then
-			return
-		end
-		for line in res:gmatch("[^\n]+") do
-			local ok2, d = pcall(HttpService.JSONDecode, HttpService, line)
-			if ok2 and type(d) == "table" and d.event == "message" and d.id then
-				since = d.id
-				onEvent(d)
-			end
+		local list = Mem.fbPull("dm/" .. myInbox, lastKey)
+		if not list then return end
+		pollOkAt = os.clock()
+		for _, d in ipairs(list) do
+			lastKey = d.id
+			onEvent(d)
 		end
 	end
 	task.spawn(function()
@@ -4276,43 +4092,20 @@ end)()
 		while Gui.Parent do
 			pcall(poll)
 			notifyOn = true
-			task.wait(wsUp and 20 or 12)
-		end
-	end)
-	task.spawn(function()
-		if not (WebSocket and WebSocket.connect) then return end
-		task.wait(0.5)
-		while Gui.Parent do
-			local ok, ws = pcall(WebSocket.connect, "wss://ntfy.sh/" .. myInbox .. "/ws")
-			if ok and ws then
-				local closed = false
-				wsUp = true
-				wsLast = os.clock()
-				pcall(function()
-					ws.OnMessage:Connect(function(raw)
-						wsLast = os.clock()
-						local ok2, d = pcall(HttpService.JSONDecode, HttpService, raw)
-						if ok2 then onEvent(d) end
-					end)
-					ws.OnClose:Connect(function() closed = true end)
-				end)
-				while Gui.Parent and not closed and os.clock() - wsLast < 100 do task.wait(0.25) end
-				wsUp = false
-				pcall(function() ws:Close() end)
-			end
-			task.wait(1)
+			task.wait(5)
 		end
 	end)
 
 	task.spawn(function()
 		while Gui.Parent do
-			local live = wsUp and (os.clock() - wsLast) < 100
+			local live = (os.clock() - pollOkAt) < 20
 			statusL.Text = live and "online" or "offline"
 			statusL.TextColor3 = live and ON or Color3.fromRGB(235, 90, 90)
 			task.wait(1)
 		end
 	end)
 
+	-- تنظيف الاشعار + تحديث دوائر الاتصال
 	task.spawn(function()
 		local tick = 0
 		while Gui.Parent do
@@ -4385,7 +4178,7 @@ T.Misc:Rainbow("start script", function()
 end)
 
 ------------------------------------------------------------------
--- NEWS
+-- NEWS (يكتب فيه lufl40 فقط، والباقي يقرأ)
 ------------------------------------------------------------------
 ;(function()
 	local HttpService = game:GetService("HttpService")
@@ -4479,6 +4272,7 @@ end)
 		saveNews()
 	end
 
+	-- الاخبار المحفوظة
 	if canFS then
 		pcall(function()
 			if isfile(newsFile) then
@@ -4497,6 +4291,7 @@ end)
 		end)
 	end
 
+	-- كتابة الاخبار: lufl40 فقط
 	if isAdmin then
 		local comp = New("Frame", {
 			Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card,
@@ -4547,36 +4342,25 @@ end)
 			}
 			addItem(m)
 			task.spawn(function()
-				local body = HttpService:JSONEncode(m)
-				if Mem.jsonSafe then body = Mem.jsonSafe(body) end
-				local ok, r = pcall(req, {
-					Url = "https://ntfy.sh/" .. NEWS_TOPIC,
-					Method = "POST",
-					Headers = {["Content-Type"] = "text/plain; charset=utf-8"},
-					Body = body,
-				})
-				if not (ok and r and (r.Success or r.StatusCode == 200)) then
+				local ok, r = pcall(Mem.fbSend, "news", HttpService:JSONEncode(m))
+				if not (ok and r) then
 					Notify("News", "Could not publish the news", C.mars2, "warn")
 				end
 			end)
 		end)
 	end
 
-	local since = "all"
+	-- استقبال الاخبار
+	local lastKey = nil
 	local function poll()
-		local ok, res = pcall(function()
-			return game:HttpGet("https://ntfy.sh/" .. NEWS_TOPIC .. "/json?poll=1&since=" .. since)
-		end)
-		if not ok or type(res) ~= "string" then return end
-		for line in res:gmatch("[^\n]+") do
-			local ok2, d = pcall(HttpService.JSONDecode, HttpService, line)
-			if ok2 and type(d) == "table" and d.event == "message" and d.id then
-				since = d.id
-				local ok3, m = pcall(HttpService.JSONDecode, HttpService, d.message or "")
-				if ok3 and type(m) == "table" and m.m then
-					m.t = tonumber(d.time) or m.t
-					pcall(addItem, m)
-				end
+		local list = Mem.fbPull("news", lastKey)
+		if not list then return end
+		for _, d in ipairs(list) do
+			lastKey = d.id
+			local ok3, m = pcall(HttpService.JSONDecode, HttpService, d.message or "")
+			if ok3 and type(m) == "table" and m.m then
+				m.t = tonumber(d.time) or m.t
+				pcall(addItem, m)
 			end
 		end
 	end
@@ -4658,6 +4442,7 @@ end
 local function OpenMain()
 	isOpen = true
 	pcall(function() Mem.S.open = true end)
+	-- بدون أنيميشن: النافذة تظهر مباشرة بحجمها الكامل (ما تتصغر لصفر) فالسكرول والتاب والقائمة يبقون مكانهم
 	MainScale.Scale = baseScale()
 	Main.Visible = true
 	Mem.ready = true
@@ -4665,6 +4450,7 @@ local function OpenMain()
 		local cur = Mem.cur
 		if cur then
 			cur.ready = true
+			-- لو كنت في الشات: ينزل لآخر رسالة
 			if cur.onShow then cur.onShow() end
 		end
 	end)
@@ -4679,6 +4465,7 @@ end
 local function ToggleMain() if isOpen then CloseMain() else OpenMain() end end
 CloseBtn.MouseButton1Click:Connect(CloseMain)
 
+-- زر تكبير / تصغير السكربت (جنب زر X)
 ;(function()
 	local b = New("TextButton", {
 		Text = "", Size = UDim2.fromOffset(32, 32), Position = UDim2.new(1, -80, 0, 7),
@@ -4709,14 +4496,16 @@ CloseBtn.MouseButton1Click:Connect(CloseMain)
 	end)
 end)()
 
+-- (سحب النافذة محذوف: السكربت ثابت، الزر العائم فقط يتحرك)
+
 ------------------------------------------------------------------
--- ORCA button
+-- ORCA button (صورة + حلقات برتقالية + كلمة ORCA)  <<< الزر الجديد
 ------------------------------------------------------------------
 local Orb
 do
-	local IMAGE_ID     = 118123159790059
-	local BUTTON_SCALE = 0.55
-	local TEXT_CYCLE   = 3
+	local IMAGE_ID     = 118123159790059  -- ID ديال الصورة (غيره لو تبي صورة ثانية)
+	local BUTTON_SCALE = 0.55             -- حجم الزر (0.5 صغير / 0.8 كبير)
+	local TEXT_CYCLE   = 3                -- كل شحال ثانية تعاود كلمة ORCA
 	local FILL_MODE    = Enum.ScaleType.Stretch
 	local IMAGE        = "rbxassetid://" .. IMAGE_ID
 
@@ -4794,6 +4583,7 @@ do
 		end
 	end)
 
+	-- سحب الزر + ضغطة = فتح/غلق السكربت
 	local dragging, moved, dStart, sPos, dInput = false, false, nil, nil, nil
 	Btn.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -4825,6 +4615,7 @@ do
 	Btn.MouseEnter:Connect(function() Tw(Btn, 0.2, {Size = UDim2.fromOffset(98, 98)}, Enum.EasingStyle.Back) end)
 	Btn.MouseLeave:Connect(function() Tw(Btn, 0.2, {Size = UDim2.fromOffset(92, 92)}, Enum.EasingStyle.Back) end)
 
+	-- أنيميشن الحلقات والتوهج والنقط
 	table.insert(conns, RunService.Heartbeat:Connect(function(dt)
 		local t = os.clock()
 
@@ -4860,6 +4651,7 @@ do
 	SelectTab(startTab)
 end
 if Mem.S.open then task.delay(0.7, OpenMain) end
+-- ظهور الزر بأنيميشن (من صفر لحجمه)
 do
 	local target = Mem.orbScale.Scale
 	Mem.orbScale.Scale = 0
