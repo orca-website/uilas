@@ -140,16 +140,23 @@ function Mem.fbSend(path, payload)
 			Headers = {["Content-Type"] = "application/json"}, Body = body,
 		})
 		local code = (ok and type(r) == "table") and tonumber(r.StatusCode) or nil
-		if ok and type(r) == "table" and (r.Success or code == 200) then return true end
+		if ok and type(r) == "table" and (r.Success or code == 200) then
+			local key
+			pcall(function()
+				local HS = game:GetService("HttpService")
+				key = HS:JSONDecode(r.Body).name
+			end)
+			return true, key
+		end
 		if code == 400 or code == 401 or code == 403 or code == 413 or code == 422 then return false end
 		task.wait(2 * try)
 	end
 	return false
 end
 -- يجلب السجلات الجديدة (بعد lastKey) مرتبة، بشكل احداث جاهزة. nil = فشل الاتصال
-function Mem.fbPull(path, lastKey)
+function Mem.fbPull(path, lastKey, limit)
 	local url = Mem.FB .. "/" .. path .. ".json?orderBy=%22%24key%22"
-	if lastKey then url = url .. "&startAt=%22" .. lastKey .. "%22" else url = url .. "&limitToLast=300" end
+	if lastKey then url = url .. "&startAt=%22" .. lastKey .. "%22" else url = url .. "&limitToLast=" .. (limit or 300) end
 	local ok, res = pcall(function() return game:HttpGet(url) end)
 	if not ok or type(res) ~= "string" then return nil end
 	local ok2, data = pcall(game:GetService("HttpService").JSONDecode, game:GetService("HttpService"), res)
@@ -167,6 +174,71 @@ function Mem.fbPull(path, lastKey)
 		out[#out + 1] = {event = "message", id = k, time = math.floor((tonumber(v.t) or os.time() * 1000) / 1000), message = v.m}
 	end
 	return out
+end
+-- حذف سجلات من السيرفر (يحتاج قواعد تسمح بالحذف)
+function Mem.fbDeleteKeys(path, keys)
+	local rq = request or http_request or (syn and syn.request) or (http and http.request)
+	if not rq or #keys == 0 then return false end
+	local good = {}
+	for _, k in ipairs(keys) do
+		if type(k) == "string" and k:match("^[%w_%-]+$") then good[#good + 1] = k end
+	end
+	local allOk = #good > 0
+	for i = 1, #good, 100 do
+		local parts = {}
+		for j = i, math.min(i + 99, #good) do parts[#parts + 1] = '"' .. good[j] .. '":null' end
+		local ok, r = pcall(rq, {
+			Url = Mem.FB .. "/" .. path .. ".json", Method = "PATCH",
+			Headers = {["Content-Type"] = "application/json"}, Body = "{" .. table.concat(parts, ",") .. "}",
+		})
+		local code = (ok and type(r) == "table") and tonumber(r.StatusCode) or nil
+		if not (ok and type(r) == "table" and (r.Success or code == 200)) then allOk = false end
+	end
+	return allOk
+end
+-- كل مفاتيح مسار (بدون المحتوى)
+function Mem.fbKeys(path)
+	local HS = game:GetService("HttpService")
+	local ok, res = pcall(function() return game:HttpGet(Mem.FB .. "/" .. path .. ".json?shallow=true") end)
+	if not ok or type(res) ~= "string" then return nil end
+	local ok2, data = pcall(HS.JSONDecode, HS, res)
+	if not ok2 then return nil end
+	if data == nil then return {} end
+	if type(data) ~= "table" or data.error then return nil end
+	local out = {}
+	for k in pairs(data) do out[#out + 1] = k end
+	table.sort(out)
+	return out
+end
+-- مسح كل الشات العام من السيرفر
+function Mem.fbClear(path)
+	local keys = Mem.fbKeys(path)
+	if keys and #keys > 0 then Mem.fbDeleteKeys(path, keys) end
+end
+-- تنظيف الشات العام: يبقي آخر 100 رسالة، ويحذف النبضات والاحداث القديمة (اكثر من 10 دقايق)
+function Mem.pruneChat()
+	local HS = game:GetService("HttpService")
+	local ok, res = pcall(function() return game:HttpGet(Mem.FB .. "/chat.json") end)
+	if not ok or type(res) ~= "string" then return end
+	local ok2, data = pcall(HS.JSONDecode, HS, res)
+	if not ok2 or type(data) ~= "table" or data.error then return end
+	local nowMs = os.time() * 1000
+	local msgs, del = {}, {}
+	for k, v in pairs(data) do
+		if type(v) == "table" then
+			local old = nowMs - (tonumber(v.t) or 0) > 600000
+			local okm, m = false, nil
+			if type(v.m) == "string" then okm, m = pcall(HS.JSONDecode, HS, v.m) end
+			if okm and type(m) == "table" and m.t == nil and m.m then
+				msgs[#msgs + 1] = k
+			elseif old then
+				del[#del + 1] = k
+			end
+		end
+	end
+	table.sort(msgs)
+	for i = 1, #msgs - 100 do del[#del + 1] = msgs[i] end
+	if #del > 0 then Mem.fbDeleteKeys("chat", del) end
 end
 -- عد تنازلي مكان زر الارسال: الزر يختفي لين تنتهي المدة ثم يرجع
 function Mem.cooldown(btn, secs)
@@ -2879,9 +2951,15 @@ end))
 		Size = UDim2.new(1, -40, 0, 16), Parent = hdr,
 	})
 	if isMe then statusL.Size = UDim2.new(1, -72, 0, 16) end
+	hdr.Size = UDim2.new(1, 0, 0, 30)
+	do
+		local tl = hdr:FindFirstChildOfClass("TextLabel")
+		if tl then tl.Size = UDim2.new(1, 0, 0, 28) end
+		statusL.Size = UDim2.new(statusL.Size.X.Scale, statusL.Size.X.Offset, 0, 28)
+	end
 
 	local holder = New("Frame", {
-		Size = UDim2.new(1, 0, 0, 246), BackgroundTransparency = 1, LayoutOrder = 2, Parent = page,
+		Size = UDim2.new(1, 0, 0, 236), BackgroundTransparency = 1, LayoutOrder = 2, Parent = page,
 	})
 
 	local list = New("ScrollingFrame", {
@@ -2911,7 +2989,7 @@ end))
 
 	-- زر التكبير / التصغير
 	local maxBtn = New("TextButton", {
-		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -28, 0.5, -12),
+		Text = "", Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -28, 0, 3),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
 	})
 	Corner(maxBtn, 8)
@@ -2967,7 +3045,7 @@ end))
 			end)
 		end
 		local clrBtn = New("TextButton", {
-			Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -62, 0.5, -12),
+			Text = "", Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -62, 0, 3),
 			BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
 		})
 		Corner(clrBtn, 8)
@@ -3356,6 +3434,7 @@ end))
 	end
 	local histDirty = false
 	local rowByCid, deleted, clearedAt = {}, {}, 0
+	local keyByCid = {}
 	task.spawn(function()
 		while Gui.Parent do
 			task.wait(3)
@@ -3415,6 +3494,7 @@ end))
 		clearAll()
 		task.spawn(function()
 			local dc = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
+			pcall(Mem.fbClear, "chat")
 			Mem.fbSend("chat", HttpService:JSONEncode({t = "x", c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName}))
 		end)
 		Notify("Public chat", "Chat cleared", C.mars2, "chat", false, 1.5)
@@ -3423,6 +3503,7 @@ end))
 		if not isMe or not cid then return end
 		removeByCid(cid)
 		task.spawn(function()
+			if keyByCid[cid] then pcall(Mem.fbDeleteKeys, "chat", {keyByCid[cid]}) end
 			local dc = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
 			Mem.fbSend("chat", HttpService:JSONEncode({t = "d", k = cid, c = dc, i = LP.UserId, n = LP.Name, d = LP.DisplayName}))
 		end)
@@ -3499,6 +3580,7 @@ end))
 			sentAt[m.c] = nil
 		end
 		local uid = tonumber(m.i)
+		if m.c then keyByCid[m.c] = d.id end
 		Mem.noteKnown(uid, m.n, m.d, stamp)
 		if m.t == "x" then
 			if (Mem.ownerId and uid == Mem.ownerId) or tostring(m.n or ""):lower() == "lufl40" then
@@ -3561,7 +3643,7 @@ end))
 
 	local lastKey, pollOkAt = nil, -1000
 	local function poll()
-		local list = Mem.fbPull("chat", lastKey)
+		local list = Mem.fbPull("chat", lastKey, 100)
 		if not list then return end
 		pollOkAt = os.clock()
 		for _, d in ipairs(list) do
@@ -3575,6 +3657,15 @@ end))
 			pcall(poll)
 			counting = true
 			task.wait(4)
+		end
+	end)
+
+	-- تنظيف كل ساعة (يبقي آخر 100 رسالة)
+	task.spawn(function()
+		task.wait(45 + math.random(0, 60))
+		while Gui.Parent do
+			pcall(Mem.pruneChat)
+			task.wait(3600)
 		end
 	end)
 
@@ -3622,7 +3713,8 @@ end))
 		sentAt[cid] = os.time()
 		local myRow = addMsg({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg})
 		task.spawn(function()
-			local sent = Mem.fbSend("chat", HttpService:JSONEncode({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
+			local sent, skey = Mem.fbSend("chat", HttpService:JSONEncode({c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, m = msg, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
+			if sent and skey then keyByCid[cid] = skey end
 			if not sent and not isOwner() then
 				-- الرسالة ما انرسلت: تنحذف ويطلع اشعار احمر 10 ثواني
 				if myRow then
@@ -3641,11 +3733,16 @@ end))
 		end)
 	end
 	-- نبض الاتصال: كل فترة نبعث "انا متصل" عشان يطلع اخضر عند غيرك
+	local lastPresKey
 	local function sendPresence(kind)
 		if not req then return end
 		local cid = LP.UserId .. "-" .. os.time() .. "-" .. math.random(1000, 9999)
 		sentAt[cid] = os.time()
-		pcall(Mem.fbSend, "chat", HttpService:JSONEncode({t = kind, c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
+		local okP, sentP, keyP = pcall(Mem.fbSend, "chat", HttpService:JSONEncode({t = kind, c = cid, i = LP.UserId, n = LP.Name, d = LP.DisplayName, j = (not Mem.noEntry) and game.JobId or nil, p = (not Mem.noEntry) and game.PlaceId or nil, x = Mem.noEntry or nil}))
+		if okP and sentP then
+			if lastPresKey then pcall(Mem.fbDeleteKeys, "chat", {lastPresKey}) end
+			lastPresKey = (kind == "p") and keyP or nil
+		end
 	end
 	Mem.sendPresence, Mem.jsonSafe = sendPresence, jsonSafe
 	task.spawn(function()
@@ -3700,6 +3797,12 @@ end)()
 	local sel, selectPartner
 	local convs, dseen, dmDots, rows, rowOrder = {}, {}, {}, {}, 0
 	local unreadBy, notifyOn = {}, false
+	local unreadKeys = {}
+	local function clearUnreadKeys(fid)
+		for k, v in pairs(unreadKeys) do
+			if v == fid then unreadKeys[k] = nil end
+		end
+	end
 	-- عدد الرسائل الجديدة لكل شخص (يطلع في قائمة السهم)
 	Mem.unreadFn = function(id) return unreadBy[id] or 0 end
 
@@ -3786,8 +3889,13 @@ end)()
 	local hdr = tab:Header("Private chat", true)
 	local statusL = Label({
 		Text = "connecting", TextSize = 10, TextColor3 = C.sub, TextXAlignment = Enum.TextXAlignment.Right,
-		Size = UDim2.new(1, -74, 0, 16), Parent = hdr,
+		Size = UDim2.new(1, -74, 0, 28), Parent = hdr,
 	})
+	hdr.Size = UDim2.new(1, 0, 0, 30)
+	do
+		local tl = hdr:FindFirstChildOfClass("TextLabel")
+		if tl then tl.Size = UDim2.new(1, 0, 0, 28) end
+	end
 
 	local picker = tab:PlayerPicker(function(p)
 		if selectPartner then selectPartner(p) end
@@ -3801,7 +3909,7 @@ end)()
 	New("UIStroke", {Color = C.card, Thickness = 2, Parent = headDot})
 
 	local holder = New("Frame", {
-		Size = UDim2.new(1, 0, 0, 190), BackgroundTransparency = 1, LayoutOrder = 3, Parent = page,
+		Size = UDim2.new(1, 0, 0, 180), BackgroundTransparency = 1, LayoutOrder = 3, Parent = page,
 	})
 	local list = New("ScrollingFrame", {
 		Size = UDim2.new(1, 0, 1, -48), BackgroundColor3 = C.card, BackgroundTransparency = 0.35, BorderSizePixel = 0,
@@ -3829,7 +3937,7 @@ end)()
 
 	-- زر التكبير / التصغير (نفس زر Public chat)
 	local maxBtn = New("TextButton", {
-		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -28, 0.5, -12),
+		Text = "", Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -28, 0, 3),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
 	})
 	Corner(maxBtn, 8)
@@ -3861,7 +3969,7 @@ end)()
 
 	-- زر البحث (جنب زر التكبير): تكتب اليوزر أو أول الاسم وتطلع لك الناس
 	local searchBtn = New("TextButton", {
-		Text = "", Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, -62, 0.5, -12),
+		Text = "", Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -62, 0, 3),
 		BackgroundColor3 = C.card, AutoButtonColor = false, ZIndex = 3, Parent = hdr,
 	})
 	Corner(searchBtn, 8)
@@ -3872,7 +3980,7 @@ end)()
 	searchBtn.MouseEnter:Connect(function() Tw(searchStroke, 0.15, {Color = C.mars2, Thickness = 2}) end)
 	searchBtn.MouseLeave:Connect(function() Tw(searchStroke, 0.15, {Color = C.mars, Thickness = 1.2}) end)
 	local searchBox = New("TextBox", {
-		Size = UDim2.new(1, -70, 0, 24), Position = UDim2.fromOffset(0, -4), BackgroundColor3 = C.card,
+		Size = UDim2.new(1, -70, 0, 22), Position = UDim2.fromOffset(0, 3), BackgroundColor3 = C.card,
 		Text = "", PlaceholderText = "Type a username...", PlaceholderColor3 = C.sub, TextColor3 = C.text,
 		Font = Enum.Font.GothamMedium, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
 		ClearTextOnFocus = false, Visible = false, ZIndex = 4, Parent = hdr,
@@ -3982,6 +4090,7 @@ end)()
 		local cv = loadConv(p.UserId)
 		for i = math.max(1, #cv.list - 59), #cv.list do addRow(cv.list[i]) end
 		unreadBy[p.UserId] = nil
+		clearUnreadKeys(p.UserId)
 		showBadge()
 		box.PlaceholderText = "Message " .. p.DisplayName
 		headDot.BackgroundColor3 = Mem.isOnline(p.UserId) and ON or OFF
@@ -4068,6 +4177,7 @@ end)()
 			addRow(m)
 		else
 			unreadBy[fid] = (unreadBy[fid] or 0) + 1
+			unreadKeys[d.id] = fid
 			showBadge()
 			if sel and sel.UserId == fid then addRow(m) end
 		end
@@ -4079,7 +4189,7 @@ end)()
 	local myInbox = inbox(LP.UserId)
 	local lastKey, pollOkAt = nil, -1000
 	local function poll()
-		local list = Mem.fbPull("dm/" .. myInbox, lastKey)
+		local list = Mem.fbPull("dm/" .. myInbox, lastKey, 100)
 		if not list then return end
 		pollOkAt = os.clock()
 		for _, d in ipairs(list) do
@@ -4093,6 +4203,33 @@ end)()
 			pcall(poll)
 			notifyOn = true
 			task.wait(5)
+		end
+	end)
+
+	-- تنظيف صندوقي كل ساعة: يبقي آخر 100 رسالة، والغير مقروءة تبقى لين تنقرأ او تمر 24 ساعة
+	local function pruneInbox()
+		local ok, res = pcall(function() return game:HttpGet(Mem.FB .. "/dm/" .. myInbox .. ".json") end)
+		if not ok or type(res) ~= "string" then return end
+		local ok2, data = pcall(HttpService.JSONDecode, HttpService, res)
+		if not ok2 or type(data) ~= "table" or data.error then return end
+		local keys = {}
+		for k, v in pairs(data) do
+			if type(v) == "table" then keys[#keys + 1] = k end
+		end
+		table.sort(keys)
+		local nowMs, del = os.time() * 1000, {}
+		for i = 1, #keys - 100 do
+			local k = keys[i]
+			local age = nowMs - (tonumber(data[k].t) or 0)
+			if age > 86400000 or (dseen[k] and not unreadKeys[k]) then del[#del + 1] = k end
+		end
+		if #del > 0 then Mem.fbDeleteKeys("dm/" .. myInbox, del) end
+	end
+	task.spawn(function()
+		task.wait(60 + math.random(0, 60))
+		while Gui.Parent do
+			pcall(pruneInbox)
+			task.wait(3600)
 		end
 	end)
 
@@ -4111,6 +4248,7 @@ end)()
 		while Gui.Parent do
 			if sel and unreadBy[sel.UserId] and viewing() then
 				unreadBy[sel.UserId] = nil
+				clearUnreadKeys(sel.UserId)
 				showBadge()
 			end
 			tick += 1
